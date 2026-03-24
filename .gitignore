@@ -1,13 +1,3 @@
-# Personal activity data - never commit
-*.fit
-*.gpx
-*.tcx
-*.track.json
-
-# Profiling and intermediate outputs
-outputs/
-*.xlsx
-
 # Python
 __pycache__/
 *.pyc
@@ -19,9 +9,9 @@ venv/
 # VS Code
 .vscode/
 
-# Power BI (commit the .pbix only if you want - it's binary)
-# reports/*.pbix
-
 # OS
 .DS_Store
 Thumbs.db
+
+# Outputs
+outputs/
