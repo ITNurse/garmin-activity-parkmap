@@ -1,29 +1,37 @@
 """
-01_preprocess_fit_files.py
+preprocess_fit_files.py
 --------------------------
 Batch-converts Garmin .fit activity files into lightweight .track.json files
 that are used by the rest of the pipeline for mapping and analysis.
 
 For each .fit file found in the input folder, the script:
-  1. Parses the binary .fit format into a Python data structure
-  2. Extracts activity metadata (sport, start time, distance, heart rate, etc.)
-  3. Extracts the GPS track points (lat, lon, timestamp, altitude, speed)
-  4. Writes the result as a compact .track.json file
+  1. Checks a persistent index (fit_index.csv) to see if this file has been
+     seen before. If it has, it is skipped without being opened.
+  2. For new files: parses the binary .fit format and checks for GPS data.
+  3. Records the result (True/False) in the index so the file is never
+     opened again on future runs.
+  4. If GPS data was found, extracts the full track and writes a .track.json.
 
 Output files are named:  YYYY_MM_DD_HHMMSS-<original_filename>.track.json
 This matches the naming convention used by the Strava pipeline so that
 tracks from both sources sort and compare consistently by date.
 
-Files that already have an output are skipped by default. Set OVERWRITE = True
-at the top of the file to force re-processing.
+The index file (fit_index.csv) is saved to config.DATA_OUTPUTS and has
+two columns:
+    filename   — the .fit filename (e.g. "789456123.fit")
+    has_gps    — True if the file contains GPS points, False otherwise
+
+This index makes repeated runs very efficient: on a run with no new files,
+every file is found in the index and skipped immediately without being opened.
 
 Usage:
     python 01_preprocess_fit_files.py
 
 Configuration:
     Input and output folders are defined in config.py at the project root.
-    FIT_DIR    — folder containing new .fit files to process  (config.RAW_DATA/new)
-    TRACKS_DIR — folder where .track.json files are written   (config.TRACKS_DIR)
+    FIT_DIR      — folder containing new .fit files to process  (config.RAW_DATA/new)
+    TRACKS_DIR   — folder where .track.json files are written   (config.TRACKS_DIR)
+    INDEX_PATH   — path to the persistent index CSV             (config.DATA_OUTPUTS/fit_index.csv)
 """
 
 import sys
@@ -40,6 +48,7 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 import config  # config.py lives at the project root and defines shared folder paths
 
+import csv
 import json
 from datetime import datetime
 from pathlib import Path
@@ -53,10 +62,14 @@ from fitparse import FitFile, FitParseError  # fitparse reads binary .fit files 
 # =============================================================================
 
 # The folder where new, unprocessed .fit files are waiting to be converted.
-FIT_DIR    = config.FIT_DIR
+FIT_DIR    = config.RAW_DATA / "new"
 
 # The folder where we'll write the output .track.json files.
 TRACKS_DIR = config.TRACKS_DIR
+
+# The persistent index CSV that records which .fit files have been seen before
+# and whether they contained GPS data. Saved alongside other data outputs.
+INDEX_PATH = config.DATA_OUTPUTS / "fit_index.csv"
 
 # If False, files that already have a corresponding output will be skipped.
 # Set to True if you want to force re-processing (e.g. after changing the output format).
@@ -66,6 +79,68 @@ OVERWRITE  = False
 # Multiplying by this constant converts semicircles → decimal degrees.
 # The formula is: 180 degrees / 2^31 semicircles.
 SEMICIRCLES_TO_DEGREES = 180 / (2 ** 31)
+
+
+# =============================================================================
+# INDEX MANAGEMENT — load and save the persistent record of seen files
+# =============================================================================
+
+def load_index(index_path: Path) -> dict[str, bool]:
+    """
+    Load the persistent GPS index from a CSV file and return it as a dict.
+
+    The index records every .fit file that has ever been opened by this script,
+    along with whether it contained GPS points. This lets future runs skip
+    files instantly without opening them.
+
+    The CSV has two columns:
+        filename  — the .fit filename, e.g. "789456123.fit"
+        has_gps   — the string "True" or "False"
+
+    Returns a dict mapping filename → has_gps (as a boolean), e.g.:
+        {
+            "789456123.fit": True,
+            "987654321.fit": False,
+        }
+
+    If the index file doesn't exist yet (first ever run), returns an empty dict.
+    """
+    if not index_path.exists():
+        # First run — no index yet. Return empty dict so everything gets processed.
+        return {}
+
+    index = {}
+    with open(index_path, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)  # Reads each row as a dict keyed by column header
+        for row in reader:
+            # Convert the "True"/"False" string back into an actual Python boolean
+            index[row["filename"]] = row["has_gps"] == "True"
+
+    return index
+
+
+def save_index(index: dict[str, bool], index_path: Path) -> None:
+    """
+    Write the in-memory index dict back out to the CSV file.
+
+    Called once at the end of each run (after all files have been processed)
+    so the updated index is ready for next time.
+
+    Arguments:
+        index       — dict mapping filename → has_gps boolean
+        index_path  — where to write the CSV file
+    """
+    # Make sure the output folder exists before trying to write the file
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(index_path, "w", encoding="utf-8", newline="") as f:
+        # DictWriter writes dicts as CSV rows using the given fieldnames as column headers
+        writer = csv.DictWriter(f, fieldnames=["filename", "has_gps"])
+        writer.writeheader()  # Write the "filename,has_gps" header row
+
+        # Sort by filename so the CSV is human-readable and easy to inspect
+        for filename, has_gps in sorted(index.items()):
+            writer.writerow({"filename": filename, "has_gps": has_gps})
 
 
 # =============================================================================
@@ -367,20 +442,28 @@ def extract_track(data: dict) -> dict | None:
 # FOLDER PROCESSING — find all .fit files and process them in bulk
 # =============================================================================
 
-def process_folder(input_dir: Path, output_dir: Path, overwrite: bool = False):
+def process_folder(input_dir: Path, output_dir: Path, index: dict[str, bool], overwrite: bool = False):
     """
     Scan input_dir for .fit files, convert each one to a .track.json file,
     and write the results to output_dir.
 
-    For each .fit file, the pipeline is:
-        parse_fit_file()  →  extract_track()  →  write .track.json
+    Uses the index dict to skip files that have been seen on a previous run,
+    so that only truly new files are ever opened and parsed.
 
-    Files are skipped (not re-processed) if their output already exists and
-    overwrite=False. This makes the script safe to run repeatedly as new
-    .fit files arrive — it only processes what's new.
+    For each new file, the pipeline is:
+        parse_fit_file()  →  extract_track()  →  update index  →  write .track.json
 
-    Prints a one-line status for each file ([ok], [skip], [warn], or [error])
+    The index is updated in-place as files are processed. The caller is
+    responsible for saving it to disk afterwards (via save_index()).
+
+    Prints a one-line status for each file ([ok], [skip], [no gps], or [error])
     and a summary at the end.
+
+    Arguments:
+        input_dir  — folder to scan for .fit files
+        output_dir — folder to write .track.json files into
+        index      — the in-memory index dict (modified in-place)
+        overwrite  — if True, re-process files even if already in TRACKS_DIR
     """
     # Create the output folder if it doesn't exist yet.
     # parents=True also creates any missing parent folders.
@@ -396,25 +479,41 @@ def process_folder(input_dir: Path, output_dir: Path, overwrite: bool = False):
         return
 
     # Counters for the summary line at the end
-    processed = skipped = failed = 0
+    processed = skipped_index = skipped_exists = no_gps = failed = 0
 
     for fit_path in fit_files:
         try:
-            # Check whether this .fit file has already been processed by looking
-            # for any existing output file whose name contains the original stem.
-            # This is cheaper than parsing the file just to reconstruct the output
-            # filename, and handles the case where Garmin exports use random numbers
-            # as filenames — we can dump all files in and only new ones get processed.
-            if not overwrite:
-                already_processed = any(
-                    fit_path.stem in existing.name
-                    for existing in output_dir.glob("*.track.json")
-                )
-                if already_processed:
-                    print(f"  [skip]  {fit_path.name}  →  already processed")
-                    skipped += 1
+            # ------------------------------------------------------------------
+            # Check 1: Has this file been seen before?
+            # If the filename is already in the index, we opened it on a previous
+            # run and recorded the result. No need to open it again.
+            # ------------------------------------------------------------------
+            if not overwrite and fit_path.name in index:
+                if index[fit_path.name]:
+                    # has_gps=True: it was processed before. Check if the output
+                    # file still exists (it could have been manually deleted).
+                    already_done = any(
+                        fit_path.stem in existing.name
+                        for existing in output_dir.glob("*.track.json")
+                    )
+                    if already_done:
+                        print(f"  [skip]  {fit_path.name}  →  already in index and output exists")
+                        skipped_index += 1
+                        continue
+                    # Output file is missing even though we processed it before —
+                    # fall through and re-process it rather than silently skipping.
+                    print(f"  [reprocess]  {fit_path.name}  →  in index but output missing, re-processing")
+                else:
+                    # has_gps=False: we already know this file has no GPS data.
+                    # Skip it immediately without opening it.
+                    print(f"  [skip]  {fit_path.name}  →  no GPS (from index)")
+                    skipped_index += 1
                     continue
-            
+
+            # ------------------------------------------------------------------
+            # This is a new file (not in the index). Parse it and record the result.
+            # ------------------------------------------------------------------
+
             # Step 1: Read the raw .fit binary into a Python dict
             data   = parse_fit_file(fit_path)
 
@@ -422,20 +521,26 @@ def process_folder(input_dir: Path, output_dir: Path, overwrite: bool = False):
             result = extract_track(data)
 
             if result is None:
-                # extract_track() returns None when there are no GPS points
-                print(f"  [warn]  {fit_path.name}  →  no GPS data found")
-                failed += 1
-                continue  # Skip to the next file
+                # No GPS points found — record this in the index so we never
+                # open this file again, then move on.
+                print(f"  [no gps] {fit_path.name}  →  no GPS data, recorded in index")
+                index[fit_path.name] = False
+                no_gps += 1
+                continue
+
+            # GPS data found — record this in the index
+            index[fit_path.name] = True
 
             # Step 3: Determine the output filename based on the activity's start time
             out_path = output_dir / build_output_filename(
                 result["meta"].get("start_time"), fit_path.stem
             )
 
-            # Step 4: Skip if output already exists and we're not in overwrite mode
+            # Step 4: Skip writing the file if the output already exists
+            # (can happen if the index was cleared but TRACKS_DIR was not)
             if out_path.exists() and not overwrite:
-                print(f"  [skip]  {fit_path.name}  →  already exists")
-                skipped += 1
+                print(f"  [skip]  {fit_path.name}  →  output file already exists")
+                skipped_exists += 1
                 continue
 
             # Step 5: Write the result to a compact JSON file.
@@ -465,8 +570,13 @@ def process_folder(input_dir: Path, output_dir: Path, overwrite: bool = False):
             failed += 1
 
     # Print a summary once all files have been processed
-    print(f"\nDone: {processed} processed, {skipped} skipped, {failed} failed.")
-    print(f"Track files written to: {output_dir.resolve()}")
+    print(f"\nDone:")
+    print(f"  {processed} processed and written")
+    print(f"  {skipped_index} skipped (already in index)")
+    print(f"  {skipped_exists} skipped (output file already exists)")
+    print(f"  {no_gps} had no GPS data (recorded in index)")
+    print(f"  {failed} errors")
+    print(f"\nTrack files written to: {output_dir.resolve()}")
 
 
 # =============================================================================
@@ -475,12 +585,15 @@ def process_folder(input_dir: Path, output_dir: Path, overwrite: bool = False):
 
 def main():
     """
-    Entry point for the script. Reads the input/output paths from the
-    configuration constants at the top of the file, validates that the
-    input folder exists, then kicks off the batch processing.
+    Entry point for the script. Loads the index, runs the batch processing,
+    then saves the updated index back to disk.
+
+    The index is loaded at the start and saved at the end — even if no new
+    files were processed, this is a fast no-op since the index hasn't changed.
     """
     input_dir  = Path(FIT_DIR)
     output_dir = Path(TRACKS_DIR)
+    index_path = Path(INDEX_PATH)
 
     if not input_dir.exists():
         print(f"Error: Input folder not found: {input_dir}")
@@ -488,12 +601,24 @@ def main():
 
     print(f"Input:  {input_dir.resolve()}")   # .resolve() prints the full absolute path
     print(f"Output: {output_dir.resolve()}")
+    print(f"Index:  {index_path.resolve()}")
     print()
 
-    process_folder(input_dir, output_dir, overwrite=OVERWRITE)
+    # Load the index from disk (returns empty dict if file doesn't exist yet)
+    index = load_index(index_path)
+    print(f"Index loaded: {len(index)} files on record "
+          f"({sum(index.values())} with GPS, {sum(not v for v in index.values())} without)")
+    print()
+
+    # Run the main processing loop, passing the index in so it can be updated
+    process_folder(input_dir, output_dir, index, overwrite=OVERWRITE)
+
+    # Save the updated index back to disk so next run benefits from it
+    save_index(index, index_path)
+    print(f"\nIndex saved: {len(index)} total files on record → {index_path.resolve()}")
 
 
-# Only call main() if this script is being run directly (e.g. `python 01_preprocess_fit_files.py`).
+# Only call main() if this script is being run directly (e.g. `python preprocess_fit_files.py`).
 # If another script imports this file, main() won't run automatically.
 if __name__ == "__main__":
     main()
