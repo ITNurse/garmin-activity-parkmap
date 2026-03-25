@@ -62,7 +62,7 @@ from fitparse import FitFile, FitParseError  # fitparse reads binary .fit files 
 # =============================================================================
 
 # The folder where new, unprocessed .fit files are waiting to be converted.
-FIT_DIR    = config.RAW_DATA / "new"
+FIT_DIR    = config.FIT_DIR
 
 # The folder where we'll write the output .track.json files.
 TRACKS_DIR = config.TRACKS_DIR
