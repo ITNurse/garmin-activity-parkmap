@@ -73,29 +73,34 @@ This project acknowledges the safety risks associated with public exposure of pe
 
 ## Exploratory Data Analysis
 
-Each input data source was profiled before any pipeline code was written. The goal was to understand the structure, quality, and quirks of each format before making any design decisions — rather than discovering edge cases mid-build. A dedicated profiling script was written for each data type, with all outputs saved to data/outputs/ as Excel workbooks for reference throughout development.
+Each input data source was profiled before any pipeline code was written. The goal was to understand the structure, quality, and quirks of each format before making any design decisions — rather than discovering edge cases mid-build. A dedicated profiling script was written for each data type, with all outputs saved to `data/outputs/` as Excel workbooks for reference throughout development.
 
 `profile_fit_files.py` scans the full `.fit` archive and produces an Excel workbook with two sheets: a field inventory listing every (message_type, field_name) pair observed across all files, with inferred data type and example values; and a GPS file summary with one row per activity containing GPS coordinates. This reduced the downstream conversion workload from ~15,000 files to ~1,400, and surfaced edge cases such as activities recorded during drives and unusually long sessions.
 
-`profile_shapefile_boundaries.py` profiles any zipped shapefile directory. It extracts each zip, reads the .shp file, handles missing CRS by defaulting to NAD83 (EPSG:4269) — the standard for federal Canadian geospatial data — and reprojects to WGS84. It writes a four-sheet Excel profile covering the raw attribute table, a column-level null/distinct/type summary, a data sheet with WKT geometry appended, and a geometry summary including bounding box and geometry type counts, and exports the reprojected data as GeoJSON for downstream use. Used here to profile the federal CLAB park boundary dataset.
-profile_geojson_boundaries.py profiles any folder of GeoJSON files, producing the same four-sheet Excel structure as the shapefile profiler and flagging any files that deviate from the expected EPSG:4326 CRS. Used here to profile additional provincial and regional boundary sources.
+`profile_boundaries.py` profiles all three park boundary data formats used in this project in a single run. It can be targeted at all configured source folders at once (default), a single folder, or a single file — specified at runtime via `--folder` or `--file` arguments. This flexibility made it easy to re-profile a single file after making corrections without reprocessing everything.
 
-`profile_wkt_boundaries.py` profiles any CSV or TXT file containing a WKT geometry column. It auto-detects the geometry column by name or content, performs light-touch type coercion on non-geometry columns, and writes a three-sheet Excel profile including a lightweight geometry summary — geometry type counts and coordinate-pair range — without requiring a GIS library. Used here to profile park boundary data from New Brunswick Open Data, which distributes spatial data as CSV with WKT geometry.
+ - For zipped shapefiles, the script extracts each zip to a temporary directory, reads the .shp file, handles missing CRS by defaulting to NAD83 (EPSG:4269) — the standard for federal Canadian geospatial data — and reprojects to WGS84. As a side effect it exports the reprojected data as a GeoJSON file for downstream use. Used here to profile the federal CLAB park boundary dataset.
+
+ - For GeoJSON files, the script flags any files that deviate from the expected EPSG:4326 CRS and reprojects if necessary. Used here to profile additional provincial and regional boundary sources.
+
+ - For CSV and TXT files containing WKT geometry, the script auto-detects the geometry column by name or content, performs light-touch type coercion on non-geometry columns, and produces a lightweight geometry summary — geometry type counts and coordinate-pair range — without requiring a GIS library. Used here to profile park boundary data from New Brunswick Open Data, which distributes spatial data as CSV with WKT geometry.
+
+Regardless of format, all three paths produce a column-level profile covering null counts, distinct value counts, inferred data types, min/max values, string length ranges, and data quality diagnostics that flag columns which appear to be dirty numerics or mixed types. Shapefiles and GeoJSON additionally produce a geometry summary covering CRS, bounding box, geometry type counts, and validity checks. All profile outputs are written as multi-sheet Excel workbooks to `data/outputs/`.
 
 
 ## Pipeline Overview
 
 ### Stage 1 — Fit File Profiling
 
-`01_preprocess_fit_files.py` parses each GPS-bearing `.fit` file into a `.track.json` file containing timestamped GPS points, plus metadata extracted directly from the `.fit` file: activity type, total distance, and total elapsed time.
+`preprocess_fit_files.py` parses each GPS-bearing `.fit` file into a `.track.json` file containing timestamped GPS points, plus metadata extracted directly from the `.fit` file: activity type, total distance, and total elapsed time.
 
 ### Stage 2 — Park Boundary Preprocessing
 
-Park boundary data arrives in multiple formats depending on source. The `02_preprocess_*` scripts normalize all sources to GeoJSON. Three formats are supported: WKT/CSV (New Brunswick Open Data), Shapefiles (federal CLAB data), and hand-drawn GeoJSON (municipal and private parks). `view_park_boundaries.py` provides visual inspection of any boundary file before use.
+Park boundary data arrives in multiple formats depending on source. The `preprocess_*_boundaries` scripts normalize all sources to GeoJSON. The two supported formats are WKT/CSV and Shapefiles. `view_park_boundaries.py` provides visual inspection of any boundary file before use.
 
 ### Stage 3 — Park Matching
 
-`03_match_geojson_parks.py` loops through all `.track.json` files and tests each GPS point against the loaded park boundary polygons, assigning a park name and park type to each track where a spatial match is found. The updated `view_tracks.py` includes park assignment as a filter in the web UI, enabling validation that tracks are correctly associated with their parks.
+`match_geojson_parks.py` loops through all `.track.json` files and tests each GPS point against the loaded park boundary polygons, assigning a park name and park type to each track where a spatial match is found. The updated `view_tracks.py` includes park assignment as a filter in the web UI, enabling validation that tracks are correctly associated with their parks.
 
 ### Stage 42 — Data Quality Review
 
@@ -119,7 +124,7 @@ Shapefiles:
  - [Yukon](https://open.yukon.ca/data/park-and-protected-areas-1m)
  - [Quebec](https://www.donneesquebec.ca/recherche/fr/dataset/aires-protegees-au-quebec) NOTE: Provincial parks in Quebec are identified with "DESIGNOM": "Parc national"
 
-WKT Files:
+CSV / WKT Files:
  - [New Brunswick](https://gnb.socrata.com/GeoNB/Provincial-Parks-Parcs-provinciaux/ixbz-22zx)
  - [Nova Scotia](https://data.novascotia.ca/Environment-and-Energy/The-Nova-Scotia-Protected-Areas-System/ticv-5du5/about_data)
 
@@ -129,13 +134,10 @@ WKT Files:
  - [Saskatchewan](https://geohub.saskatchewan.ca/datasets/2dcf3ee92e2c4d25a109eeac74f085af_4/explore?location=54.118350%2C-106.081600%2C6)
  - [Manitoba](https://geoportal.gov.mb.ca/datasets/0b8e5b5280904fa4aeba7baf78154e59_0/explore?location=54.462779%2C-97.721135%2C6)
  - [Ontario](https://geohub.lio.gov.on.ca/datasets/provincial-park-regulated)
-
-
  - [Newfoundland and Labrador](https://geohub-gnl.hub.arcgis.com/datasets/00334d53ecf04512b9c901f311a03dcd_0/explore?location=-0.000000%2C0.000000%2C2.00)
  
 
 `Other parks` such as municipal and private parks, which accounted for a significant proportion of personal activity locations, were not available in any open dataset and had to be created manually using [geojson.io](https://geojson.io).
-
 
 Shapefiles and WKT files required a dedicated preprocessing script to normalize to GeoJSON before the park matching stage could run against a consistent input.
 
