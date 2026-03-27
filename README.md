@@ -28,7 +28,7 @@ Before building a full pipeline, a [proof-of-concept repository](https://github.
 The complete pipeline was developed and validated against real personal Garmin activity data. This version lives locally and is intentionally excluded from version control. Personal GPS traces, precise timestamps, and any visualizations derived from real movement data are not shared publicly.
 
 **Phase 3 — Public Repository (Synthetic Data, Ontario)**
-To make the project shareable without exposing personal location data, a synthetic dataset was generated using trail geometries sourced from OpenStreetMap via the Overpass API, covering parks in Ontario and Quebec. Tracks were re-dated using per-trail scheduling scripts to simulate a realistic multi-year activity history. The public repository ([garmin_project](https://github.com/ITNurse/garmin_project)) runs the identical pipeline against this synthetic data.
+To make the project shareable without exposing personal location data, a synthetic dataset was generated using trail geometries sourced from OpenStreetMap via the Overpass API, covering parks in Ontario and Quebec. Tracks were re-dated using per-trail scheduling scripts to simulate a realistic multi-year activity history. 
 
 ---
 
