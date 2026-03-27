@@ -24,10 +24,10 @@ This project was not built in one pass. It evolved through three distinct phases
 **Phase 1 — Proof of Concept**
 Before building a full pipeline, a [proof-of-concept repository](https://github.com/ITNurse/garmin_project_POC) was created to validate the core spatial question: can GPS points from a `.fit` file be reliably intersected with park boundary polygons using open data and Python? The POC used both New Brunswick and Ontario synthetic data, and confirmed the approach was viable. This gave confidence to invest in a full pipeline.
 
-**Phase 2 — Full Pipeline (Personal Data, New Brunswick)**
+**Phase 2 — Full Pipeline (Personal Data)**
 The complete pipeline was developed and validated against real personal Garmin activity data. This version lives locally and is intentionally excluded from version control. Personal GPS traces, precise timestamps, and any visualizations derived from real movement data are not shared publicly.
 
-**Phase 3 — Public Repository (Synthetic Data, Ontario)**
+**Phase 3 — Public Repository (Synthetic Data)**
 To make the project shareable without exposing personal location data, a synthetic dataset was generated using trail geometries sourced from OpenStreetMap via the Overpass API, covering parks in Ontario and Quebec. Tracks were re-dated using per-trail scheduling scripts to simulate a realistic multi-year activity history. 
 
 ---
