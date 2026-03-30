@@ -52,8 +52,7 @@ This project acknowledges the safety risks associated with public exposure of pe
 | Language | Python |
 | IDE | Visual Studio Code |
 | Key libraries | `fitparse`, `geopandas`, `shapely`, `flask`, `matplotlib`, `contextily` |
-| Activity data | Garmin full account export (`.fit` files) |
-| Park boundary data | Provincial Open Data (various), Government of Canada CLAB (Shapefile), custom hand-drawn boundaries (GeoJSON via geojson.io) |
+| Hand drawn park boundaries | geojson.io |
 | Visualization | Power BI |
 
 ---
@@ -72,7 +71,7 @@ This project acknowledges the safety risks associated with public exposure of pe
 
 ## Exploratory Data Analysis
 
-Each input data source was profiled before any pipeline code was written. The goal was to understand the structure, quality, and quirks of each format before making any design decisions — rather than discovering edge cases mid-build. A dedicated profiling script was written for each data type, with all outputs saved to `data/outputs/` as Excel workbooks for reference throughout development.
+Each input data source was profiled before any pipeline code was written. The goal was to understand the structure, quality, and quirks of each format before making any design decisions, rather than discovering edge cases mid-build. A dedicated profiling script was written for the boundary files, and another for the .fit files. All outputs saved to `data/outputs/` as Excel workbooks for reference throughout development.
 
 `profile_fit_files.py` scans the full `.fit` archive and produces an Excel workbook with two sheets: a field inventory listing every (message_type, field_name) pair observed across all files, with inferred data type and example values; and a GPS file summary with one row per activity containing GPS coordinates. This reduced the downstream conversion workload from ~15,000 files to ~1,400, and surfaced edge cases such as activities recorded during drives and unusually long sessions.
 
@@ -89,13 +88,13 @@ Regardless of format, all three paths produce a column-level profile covering nu
 
 ## Pipeline Overview
 
-### Stage 1 — Fit File Profiling
+### Stage 1 — Fit File Processing
 
-`preprocess_fit_files.py` parses each GPS-bearing `.fit` file into a `.track.json` file containing timestamped GPS points, plus metadata extracted directly from the `.fit` file: activity type, total distance, and total elapsed time.
+`preprocess_fit_files.py` parses each GPS-bearing `.fit` file into a `.track.json` file containing timestamped GPS points, plus metadata extracted directly from the `.fit` file: activity type, total distance, and total elapsed time. `view_tracks.py` provides visual inspection of the files before proceeding.
 
 ### Stage 2 — Park Boundary Preprocessing
 
-Park boundary data arrives in multiple formats depending on source. The `preprocess_*_boundaries` scripts normalize all sources to GeoJSON. The two supported formats are WKT/CSV and Shapefiles. `view_park_boundaries.py` provides visual inspection of any boundary file before use.
+Park boundary data arrives in multiple formats depending on source. The `preprocess_park_boundaries.py` script normalizes all sources to GeoJSON, detecting the appropriate conversion automatically by file extension. Zipped shapefiles are reprojected to WGS-84 and converted; CSV and TXT files containing WKT geometry are parsed and converted; and files that are already valid GeoJSON are copied through as-is. `view_park_boundaries.py` provides visual inspection of any boundary file before use.
 
 ### Stage 3 — Park Matching
 
@@ -121,19 +120,27 @@ The final output is an interactive Power BI report that connects directly to the
 
 Shapefiles:
  - [Yukon](https://open.yukon.ca/data/park-and-protected-areas-1m)
- - [Quebec](https://www.donneesquebec.ca/recherche/fr/dataset/aires-protegees-au-quebec) NOTE: Provincial parks in Quebec are identified with "DESIGNOM": "Parc national"
+ - [Quebec](https://www.donneesquebec.ca/recherche/fr/dataset/aires-protegees-au-quebec) 
+    - NOTE: Park types are available in the DESIGNOM field
 
 CSV / WKT Files:
  - [New Brunswick](https://gnb.socrata.com/GeoNB/Provincial-Parks-Parcs-provinciaux/ixbz-22zx)
+    - Note: Does not include "Park Type" data, but all parks in data set are of type Provincial Park
  - [Nova Scotia](https://data.novascotia.ca/Environment-and-Energy/The-Nova-Scotia-Protected-Areas-System/ticv-5du5/about_data)
-
+    - Note: Park types are available in the Protect1 field
  GeoJSON Files:
  - [British Columbia](https://catalogue.data.gov.bc.ca/dataset/bc-parks-ecological-reserves-and-protected-areas)
+    -   Note: Required completing a download request form. The park types are available in the "PROTECTED_LANDS_CODE" field, however they are coded.
  - [Alberta](https://geodiscover.alberta.ca/geoportal/rest/metadata/item/0d1ac1474eba42fe9444a42a23a4ea1b/html)
+    -   Notes: Required a separate script src\preparation\alberta.py to access data through their API. Also, park types are only available as codes. The mapping is hardcoded in the necessary locations in scripts.
  - [Saskatchewan](https://geohub.saskatchewan.ca/datasets/2dcf3ee92e2c4d25a109eeac74f085af_4/explore?location=54.118350%2C-106.081600%2C6)
+     - Note: Park types are available in the PARKTYPE field, however they are coded.
  - [Manitoba](https://geoportal.gov.mb.ca/datasets/0b8e5b5280904fa4aeba7baf78154e59_0/explore?location=54.462779%2C-97.721135%2C6)
+     - Note: Park types are available in the TYPE_E field
  - [Ontario](https://geohub.lio.gov.on.ca/datasets/provincial-park-regulated)
+     - Note: Two park types are available in the TYPE_ENG field: provincial park and protected area - far north. The provincial parks are further subdivided in the PROVINCIAL_PARK_CLASS_ENG field.
  - [Newfoundland and Labrador](https://geohub-gnl.hub.arcgis.com/datasets/00334d53ecf04512b9c901f311a03dcd_0/explore?location=-0.000000%2C0.000000%2C2.00)
+    - Note: Does not include "Park Type" data.
  
 
 `Other parks` such as municipal and private parks, which accounted for a significant proportion of personal activity locations, were not available in any open dataset and had to be created manually using [geojson.io](https://geojson.io).
