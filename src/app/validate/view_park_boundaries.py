@@ -52,29 +52,66 @@ if not PARKS_DIR.exists():
 
 
 # =============================================================================
-# PARK TYPE ACRONYM EXPANSIONS
-# Keys are upper-cased for case-insensitive matching.
-# Add new per-source dictionaries here as needed.
+# PER-SOURCE PARK TYPE RESOLUTION
+#
+# PARK_TYPE_HOOKS maps a lowercase substring of the GeoJSON filename stem to a
+# callable with signature:
+#
+#     (props: dict, raw_type: str | None) -> str | None
+#
+# The callable receives the full feature properties dict and the raw type
+# string already extracted by the generic lookup (may be None), and returns
+# the final resolved type string (or None to leave it unset).
+#
+# For simple acronym-only sources a helper is provided: acronym_map(mapping).
+# For sources that need richer logic, write the function directly.
 # =============================================================================
 
-ALBERTA_PARK_TYPES: dict[str, str] = {
-    "ER":  "Ecological Reserve",
-    "HR":  "Heritage Rangeland",
-    "NA":  "Natural Area",
-    "NP":  "National Park",
-    "PP":  "Provincial Park",
-    "PRA": "Provincial Recreation Area",
-    "WA":  "Wilderness Area",
-    "WPP": "Wildland",
-}
+def acronym_map(mapping: dict[str, str]):
+    """Return a hook that expands acronyms using the given dict."""
+    def _hook(props: dict, raw: str | None) -> str | None:
+        if raw is None:
+            return None
+        return mapping.get(raw.upper(), raw)
+    return _hook
 
-SASKATCHEWAN_PARK_TYPES: dict[str, str] = {
-    "RS":   "Recreation Site",
-    "PA":   "Protected Area",
-    "HS":   "Historic Site",
-    "PP-H": "Provincial Park",
-    "PP-W": "Provincial Park",
-    "PP-N": "Provincial Park",
+
+def _ontario_park_type(props: dict, raw: str | None) -> str | None:
+    """
+    Ontario: use TYPE_ENG as the base, but for Provincial Parks replace it
+    with 'Provincial Park - {class}' using PROVINCIAL_PARK_CLASS_ENG,
+    unless that class is blank or 'Unclassified'.
+    """
+    base = (props.get("TYPE_ENG") or raw or "").strip()
+    if not base:
+        return None
+    if base == "Provincial Park":
+        cls = (props.get("PROVINCIAL_PARK_CLASS_ENG") or "").strip()
+        if cls and cls.lower() != "unclassified":
+            return f"Provincial Park - {cls}"
+    return base
+
+
+PARK_TYPE_HOOKS: dict[str, callable] = {
+    "alberta": acronym_map({
+        "ER":  "Ecological Reserve",
+        "HR":  "Heritage Rangeland",
+        "NA":  "Natural Area",
+        "NP":  "National Park",
+        "PP":  "Provincial Park",
+        "PRA": "Provincial Recreation Area",
+        "WA":  "Wilderness Area",
+        "WPP": "Wildland",
+    }),
+    "saskatchewan": acronym_map({
+        "RS":   "Recreation Site",
+        "PA":   "Protected Area",
+        "HS":   "Historic Site",
+        "PP-H": "Provincial Park",
+        "PP-W": "Provincial Park",
+        "PP-N": "Provincial Park",
+    }),
+    "ontario": _ontario_park_type,
 }
 
 # =============================================================================
@@ -148,12 +185,12 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
         )
         if park_type:
             park_type = str(park_type).strip()
-            # Expand province-specific park type acronyms based on filename
-            stem_lower = path.stem.lower()
-            if "alberta" in stem_lower:
-                park_type = ALBERTA_PARK_TYPES.get(park_type.upper(), park_type)
-            elif "saskatchewan" in stem_lower:
-                park_type = SASKATCHEWAN_PARK_TYPES.get(park_type.upper(), park_type)
+
+        # Apply any per-source park type hook (first matching key wins)
+        stem_lower = path.stem.lower()
+        hook = next((fn for key, fn in PARK_TYPE_HOOKS.items() if key in stem_lower), None)
+        if hook:
+            park_type = hook(props, park_type)
 
         source   = path.stem
         area_ha  = props.get("area_ha") or props.get("HA_GIS") or props.get("AREA_HA") or props.get("Shape_Area")
