@@ -65,8 +65,16 @@ ALBERTA_PARK_TYPES: dict[str, str] = {
     "PP":  "Provincial Park",
     "PRA": "Provincial Recreation Area",
     "WA":  "Wilderness Area",
-    "WP":  "Wilderness Park",
     "WPP": "Wildland",
+}
+
+SASKATCHEWAN_PARK_TYPES: dict[str, str] = {
+    "RS":   "Recreation Site",
+    "PA":   "Protected Area",
+    "HS":   "Historic Site",
+    "PP-H": "Provincial Park",
+    "PP-W": "Provincial Park",
+    "PP-N": "Provincial Park",
 }
 
 # =============================================================================
@@ -140,9 +148,12 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
         )
         if park_type:
             park_type = str(park_type).strip()
-            # Expand Alberta park type acronyms when the source file is an Alberta dataset
-            if "alberta" in path.stem.lower():
+            # Expand province-specific park type acronyms based on filename
+            stem_lower = path.stem.lower()
+            if "alberta" in stem_lower:
                 park_type = ALBERTA_PARK_TYPES.get(park_type.upper(), park_type)
+            elif "saskatchewan" in stem_lower:
+                park_type = SASKATCHEWAN_PARK_TYPES.get(park_type.upper(), park_type)
 
         source   = path.stem
         area_ha  = props.get("area_ha") or props.get("HA_GIS") or props.get("AREA_HA") or props.get("Shape_Area")
@@ -425,35 +436,6 @@ HTML_TEMPLATE = """
   /* ── Map ── */
   #map-container { margin-left: var(--sidebar-w); height: 100vh; position: relative; }
   #map { width: 100%; height: 100%; }
-  #empty {
-    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
-    text-align: center; color: var(--text-dim); font-size: 13px; pointer-events: none;
-  }
-
-  /* ── Info panel (top-right) ── */
-  #info-panel {
-    position: absolute; top: 16px; right: 16px;
-    background: var(--surface); border: 1px solid var(--border2);
-    border-radius: 8px; padding: 0; width: 290px;
-    max-height: calc(100vh - 80px); overflow-y: auto;
-    font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,0.4); display: none;
-    z-index: 800;
-  }
-  #info-panel.visible { display: block; }
-  .info-card { padding: 12px 14px; border-bottom: 1px solid var(--border); }
-  .info-card:last-child { border-bottom: none; }
-  .info-card-title {
-    font-size: 11px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 0.5px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
-  }
-  .info-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
-  .info-card .row {
-    display: flex; justify-content: space-between; margin-bottom: 3px;
-    padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.04); word-break: break-word;
-  }
-  .info-card .row:last-child { border: none; }
-  .info-card .label { color: var(--text-dim); flex-shrink: 0; margin-right: 8px; }
-  .info-card .value { color: var(--text); font-weight: 700; text-align: right; }
 
   /* ── Leaflet overrides ── */
   .leaflet-popup-content-wrapper {
@@ -527,11 +509,6 @@ HTML_TEMPLATE = """
 
 <div id="map-container">
   <div id="map"></div>
-  <div id="empty">
-    <p>Select a park boundary from the sidebar.<br>
-    <small style="color:var(--text-dim)">Click again to deselect.</small></p>
-  </div>
-  <div id="info-panel"></div>
 </div>
 
 <script>
@@ -617,7 +594,6 @@ function clearParks() {
   });
   document.getElementById('btn-select-all-parks').classList.remove('active');
   updateParkSelBar();
-  updateInfoPanel();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -637,7 +613,6 @@ async function selectAllParks() {
     });
     btn.classList.remove('active');
     updateParkSelBar();
-    updateInfoPanel();
     return;
   }
   btn.classList.add('active');
@@ -677,40 +652,6 @@ function geomToLeafletLayers(geom, colour) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// INFO PANEL
-// ═══════════════════════════════════════════════════════════════════
-function updateInfoPanel() {
-  const panel = document.getElementById('info-panel');
-  if (selectedParks.size === 0) {
-    panel.className = ''; panel.innerHTML = '';
-    document.getElementById('empty').style.display = '';
-    return;
-  }
-  document.getElementById('empty').style.display = 'none';
-  panel.className = 'visible'; panel.innerHTML = '';
-
-  selectedParks.forEach(({ colour, parkData }) => {
-    const card = document.createElement('div');
-    card.className = 'info-card';
-    const skip = new Set(['geometry', 'type', 'id']);
-    const propRows = Object.entries(parkData.properties || {})
-      .filter(([k]) => !skip.has(k.toLowerCase()))
-      .slice(0, 12)
-      .map(([k, v]) =>
-        '<div class="row"><span class="label">' + k + '</span><span class="value">' + (v != null ? String(v) : '—') + '</span></div>'
-      ).join('');
-    card.innerHTML =
-      '<div class="info-card-title"><span class="info-swatch" style="background:' + colour + '"></span>' + (parkData.name || 'Unnamed') + '</div>' +
-      '<div class="row"><span class="label">File</span><span class="value">' + parkData.source + '</span></div>' +
-      (parkData.park_type ? '<div class="row"><span class="label">Type</span><span class="value">' + parkData.park_type + '</span></div>' : '') +
-      (parkData.area_ha != null ? '<div class="row"><span class="label">Area</span><span class="value">' + fmtArea(parkData.area_ha) + '</span></div>' : '') +
-      (parkData.province ? '<div class="row"><span class="label">Province</span><span class="value">' + parkData.province + '</span></div>' : '') +
-      propRows;
-    panel.appendChild(card);
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════════
 // TOGGLE PARK BOUNDARY
 // ═══════════════════════════════════════════════════════════════════
 async function togglePark(id) {
@@ -721,7 +662,7 @@ async function togglePark(id) {
     if (item) { item.classList.remove('active'); item.style.removeProperty('--park-color'); }
     const allSelected = filteredBoundaries.length > 0 && filteredBoundaries.every(p => selectedParks.has(p.id));
     document.getElementById('btn-select-all-parks').classList.toggle('active', allSelected);
-    updateParkSelBar(); updateInfoPanel(); fitParks(); return;
+    updateParkSelBar(); fitParks(); return;
   }
   const res  = await fetch('/api/boundary/' + id);
   const data = await res.json();
@@ -743,7 +684,7 @@ async function togglePark(id) {
   selectedParks.set(id, { colour, layers, parkData: data });
   const item = document.querySelector('.park-item[data-id="' + id + '"]');
   if (item) { item.classList.add('active'); item.style.setProperty('--park-color', colour); }
-  fitParks(); updateParkSelBar(); updateInfoPanel();
+  fitParks(); updateParkSelBar();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -800,6 +741,32 @@ function renderParkList() {
 // ═══════════════════════════════════════════════════════════════════
 // WIRE UP CONTROLS
 // ═══════════════════════════════════════════════════════════════════
+
+// Repopulate the type dropdown to only show types present in the
+// currently selected source file (or all types when no source is selected).
+function updateTypeFilter() {
+  const src = document.getElementById('park-source-filter').value;
+  const sel = document.getElementById('park-type-filter');
+  const prev = sel.value; // preserve selection if still valid
+
+  const types = [...new Set(
+    allBoundaries
+      .filter(p => !src || p.source === src)
+      .map(p => p.park_type)
+      .filter(Boolean)
+  )].sort();
+
+  sel.innerHTML = '<option value="">🏷 All types</option>';
+  types.forEach(t => {
+    const opt = document.createElement('option');
+    opt.value = t; opt.textContent = t;
+    sel.appendChild(opt);
+  });
+
+  // Restore previous selection only if it still exists in the new list
+  sel.value = types.includes(prev) ? prev : '';
+}
+
 document.querySelectorAll('.sort-btn[data-psort]').forEach(btn => {
   btn.onclick = () => {
     document.querySelectorAll('.sort-btn[data-psort]').forEach(b => b.classList.remove('active'));
@@ -807,7 +774,10 @@ document.querySelectorAll('.sort-btn[data-psort]').forEach(btn => {
   };
 });
 document.getElementById('park-search').addEventListener('input', renderParkList);
-document.getElementById('park-source-filter').addEventListener('change', renderParkList);
+document.getElementById('park-source-filter').addEventListener('change', () => {
+  updateTypeFilter();
+  renderParkList();
+});
 document.getElementById('park-type-filter').addEventListener('change', renderParkList);
 
 // ═══════════════════════════════════════════════════════════════════
@@ -818,16 +788,14 @@ async function init() {
   const label = document.getElementById('loading-label');
   fill.style.width = '20%';
 
-  const [boundariesRes, sourcesRes, typesRes] = await Promise.all([
+  const [boundariesRes, sourcesRes] = await Promise.all([
     fetch('/api/boundaries'),
     fetch('/api/boundary-sources'),
-    fetch('/api/boundary-types'),
   ]);
   fill.style.width = '70%'; label.textContent = 'Parsing data…';
 
   allBoundaries = await boundariesRes.json();
   const sources = await sourcesRes.json();
-  const types   = await typesRes.json();
 
   fill.style.width = '90%'; label.textContent = 'Rendering…';
   await new Promise(r => setTimeout(r, 30));
@@ -839,12 +807,8 @@ async function init() {
     document.getElementById('park-source-filter').appendChild(opt);
   });
 
-  // Populate park type filter
-  types.forEach(t => {
-    const opt = document.createElement('option');
-    opt.value = t; opt.textContent = t;
-    document.getElementById('park-type-filter').appendChild(opt);
-  });
+  // Populate park type filter (all types, no source restriction yet)
+  updateTypeFilter();
 
   renderParkList();
 
