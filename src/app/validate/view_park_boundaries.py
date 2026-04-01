@@ -210,6 +210,46 @@ def _load_field_map(path: Path) -> dict[str, dict]:
 # module is first imported (or when the script is run directly).
 SOURCE_FIELDS: dict[str, dict] = _load_field_map(FIELD_MAP_PATH)
 
+# Reverse lookup: keyword → display province name, built from the same workbook
+# data so it never goes out of sync.  National park files are mapped to their
+# province via the filename (e.g. "ON_National_Parks" → "Ontario").
+# Keys are the same lowercase underscore keywords used in SOURCE_FIELDS.
+# Values are the original sentence-case province names from the spreadsheet.
+#
+# This is built separately from SOURCE_FIELDS because _load_field_map() only
+# stores field specs, not the original province name strings.
+def _build_keyword_to_province(path: Path) -> dict[str, str]:
+    """
+    Read the Province column from ProvincialParks tab and return a dict mapping
+    each lowercase-underscore keyword back to its display name.
+
+    For example:
+        {"ontario": "Ontario", "british_columbia": "British Columbia", ...}
+
+    National park files are handled in load_parks_from_file() by checking
+    whether the filename contains a province keyword.
+
+    Args:
+        path: Path to the Excel workbook.
+
+    Returns:
+        A dict of keyword → display name, or empty dict if file is missing.
+    """
+    if not path.exists():
+        return {}
+    xl = pd.read_excel(path, sheet_name=None)
+    prov_df = xl.get("ProvincialParks", pd.DataFrame())
+    result = {}
+    for _, row in prov_df.iterrows():
+        province = str(row.get("Province", "")).strip()
+        if not province or province == "nan":
+            continue
+        keyword = province.strip().lower().replace(" ", "_")
+        result[keyword] = province  # e.g. "ontario" → "Ontario"
+    return result
+
+KEYWORD_TO_PROVINCE: dict[str, str] = _build_keyword_to_province(FIELD_MAP_PATH)
+
 
 def _get_source_fields(stem_lower: str) -> dict | None:
     """
@@ -541,12 +581,19 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
             # No field map entry — try a long list of common field names used
             # across different provinces and data sources.
             name = (
+                props.get("PROTECTED_AREA_NAME_ENG") or
+                props.get("PROTECTED_LANDS_NAME") or
+                props.get("Pro_Name") or
                 props.get("name") or
                 props.get("NAME") or
                 props.get("park_name") or
                 props.get("PARK_NAME") or
                 props.get("PARKNM") or
                 props.get("NAME_E") or
+                props.get("NAMEEN") or
+                props.get("label") or
+                props.get("LABEL") or
+                props.get("TOPONYME") or
                 f"Park {id_offset + i + 1}"  # Last resort: a numbered placeholder.
             )
 
@@ -563,6 +610,18 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
                 props.get("type") or
                 props.get("TYPE_E") or
                 props.get("TYPE_ENG") or
+                props.get("PROTECTED_AREA_TYPE") or
+                props.get("PROTECTED_LANDS_DESIGNATION") or
+                props.get("IUCN_CAT") or
+                props.get("iucn_cat") or
+                props.get("DESIGNATION") or
+                props.get("DESIGNOM") or
+                props.get("designation") or
+                props.get("LAND_CLASS") or
+                props.get("land_class") or
+                props.get("MGMT_CLASS") or
+                props.get("CLASS") or
+                props.get("Protect1") or
                 None
             )
 
@@ -600,13 +659,48 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
 
         # The filename stem (without extension) is used as the "source" identifier
         # in the UI, e.g. "alberta_provincial_parks".
-        source   = path.stem
+        source = path.stem
 
-        # Province is an optional field that may not exist in many files.
-        province = (
-            props.get("province") or props.get("PROVINCE") or
-            props.get("prov")     or props.get("PROV")     or ""
-        )
+        # Derive the display province name from the filename.
+        #
+        # Provincial park files contain the full province name in the stem
+        # (e.g. "ontario_provincial_parks") so a simple keyword substring
+        # match against KEYWORD_TO_PROVINCE works fine.
+        #
+        # National park files use a two-letter prefix instead
+        # (e.g. "ON_National_Parks", "NB_National_Parks"), so we need a
+        # separate abbreviation lookup for those.
+        NATIONAL_PARK_ABBREVS: dict[str, str] = {
+            "ab": "Alberta",
+            "bc": "British Columbia",
+            "mb": "Manitoba",
+            "nb": "New Brunswick",
+            "nl": "Newfoundland",
+            "ns": "Nova Scotia",
+            "on": "Ontario",
+            "qc": "Quebec",
+            "sk": "Saskatchewan",
+            "yt": "Yukon",
+        }
+
+        if "national_parks" in stem_lower:
+            # Extract the two-letter prefix before the first underscore,
+            # e.g. "on_national_parks" → "on"
+            prefix = stem_lower.split("_")[0]
+            province = NATIONAL_PARK_ABBREVS.get(prefix, "")
+        else:
+            # For provincial files, match the full keyword against the stem.
+            province = next(
+                (display for kw, display in KEYWORD_TO_PROVINCE.items() if kw in stem_lower),
+                None,
+            )
+            # Fall back to a province field in the GeoJSON properties if the
+            # filename didn't match any known keyword.
+            if not province:
+                province = (
+                    props.get("province") or props.get("PROVINCE") or
+                    props.get("prov")     or props.get("PROV")     or ""
+                )
 
         parks.append({
             "id":        id_offset + i,   # Globally unique integer ID for this park.
@@ -757,6 +851,19 @@ def api_boundary_types():
     This endpoint is retained for convenience and potential future use.
     """
     seen = sorted({p["park_type"] for p in ALL_PARK_BOUNDARIES if p["park_type"]})
+    return jsonify(seen)
+
+
+@app.route("/api/boundary-provinces")
+def api_boundary_provinces():
+    """
+    Return a sorted list of unique province display names.
+
+    Used to populate the province filter dropdown. Because province is derived
+    from the filename keyword, this list is always consistent regardless of
+    what (if anything) the GeoJSON properties contain.
+    """
+    seen = sorted({p["province"] for p in ALL_PARK_BOUNDARIES if p["province"]})
     return jsonify(seen)
 
 
@@ -1015,6 +1122,9 @@ HTML_TEMPLATE = """
 
   <div class="ctrl-section-label">Filter by</div>
   <div id="park-filter-row">
+    <select id="park-province-filter" class="filter-select">
+      <option value="">🍁 All provinces</option>
+    </select>
     <select id="park-source-filter" class="filter-select">
       <option value="">🌲 All files</option>
     </select>
@@ -1214,12 +1324,14 @@ async function togglePark(id) {
 function renderParkList() {
   const list = document.getElementById('park-list');
   const q    = document.getElementById('park-search').value.toLowerCase();
+  const prov = document.getElementById('park-province-filter').value;
   const src  = document.getElementById('park-source-filter').value;
   const typ  = document.getElementById('park-type-filter').value;
 
   filteredBoundaries = allBoundaries.filter(p => {
-    if (src && p.source !== src) return false;
-    if (typ && p.park_type !== typ) return false;
+    if (prov && p.province !== prov) return false;
+    if (src  && p.source   !== src)  return false;
+    if (typ  && p.park_type !== typ) return false;
     if (q && !(p.name || '').toLowerCase().includes(q) &&
              !(p.source    || '').toLowerCase().includes(q) &&
              !(p.park_type || '').toLowerCase().includes(q) &&
@@ -1263,16 +1375,41 @@ function renderParkList() {
 // WIRE UP CONTROLS
 // ═══════════════════════════════════════════════════════════════════
 
+// Repopulate the source dropdown to only show files present in the
+// currently selected province (or all files when no province is selected).
+function updateSourceFilter() {
+  const prov = document.getElementById('park-province-filter').value;
+  const sel  = document.getElementById('park-source-filter');
+  const prev = sel.value;
+
+  const sources = [...new Set(
+    allBoundaries
+      .filter(p => !prov || p.province === prov)
+      .map(p => p.source)
+      .filter(Boolean)
+  )].sort();
+
+  sel.innerHTML = '<option value="">🌲 All files</option>';
+  sources.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s; opt.textContent = s;
+    sel.appendChild(opt);
+  });
+
+  sel.value = sources.includes(prev) ? prev : '';
+}
+
 // Repopulate the type dropdown to only show types present in the
-// currently selected source file (or all types when no source is selected).
+// currently selected province and/or source file.
 function updateTypeFilter() {
-  const src = document.getElementById('park-source-filter').value;
-  const sel = document.getElementById('park-type-filter');
-  const prev = sel.value; // preserve selection if still valid
+  const prov = document.getElementById('park-province-filter').value;
+  const src  = document.getElementById('park-source-filter').value;
+  const sel  = document.getElementById('park-type-filter');
+  const prev = sel.value;
 
   const types = [...new Set(
     allBoundaries
-      .filter(p => !src || p.source === src)
+      .filter(p => (!prov || p.province === prov) && (!src || p.source === src))
       .map(p => p.park_type)
       .filter(Boolean)
   )].sort();
@@ -1284,7 +1421,6 @@ function updateTypeFilter() {
     sel.appendChild(opt);
   });
 
-  // Restore previous selection only if it still exists in the new list
   sel.value = types.includes(prev) ? prev : '';
 }
 
@@ -1295,6 +1431,11 @@ document.querySelectorAll('.sort-btn[data-psort]').forEach(btn => {
   };
 });
 document.getElementById('park-search').addEventListener('input', renderParkList);
+document.getElementById('park-province-filter').addEventListener('change', () => {
+  updateSourceFilter();
+  updateTypeFilter();
+  renderParkList();
+});
 document.getElementById('park-source-filter').addEventListener('change', () => {
   updateTypeFilter();
   renderParkList();
@@ -1309,17 +1450,26 @@ async function init() {
   const label = document.getElementById('loading-label');
   fill.style.width = '20%';
 
-  const [boundariesRes, sourcesRes] = await Promise.all([
+  const [boundariesRes, sourcesRes, provincesRes] = await Promise.all([
     fetch('/api/boundaries'),
     fetch('/api/boundary-sources'),
+    fetch('/api/boundary-provinces'),
   ]);
   fill.style.width = '70%'; label.textContent = 'Parsing data…';
 
   allBoundaries = await boundariesRes.json();
-  const sources = await sourcesRes.json();
+  const sources   = await sourcesRes.json();
+  const provinces = await provincesRes.json();
 
   fill.style.width = '90%'; label.textContent = 'Rendering…';
   await new Promise(r => setTimeout(r, 30));
+
+  // Populate province filter
+  provinces.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p; opt.textContent = p;
+    document.getElementById('park-province-filter').appendChild(opt);
+  });
 
   // Populate source filter
   sources.forEach(s => {
@@ -1328,7 +1478,7 @@ async function init() {
     document.getElementById('park-source-filter').appendChild(opt);
   });
 
-  // Populate park type filter (all types, no source restriction yet)
+  // Populate park type filter (all types, no restrictions yet)
   updateTypeFilter();
 
   renderParkList();
