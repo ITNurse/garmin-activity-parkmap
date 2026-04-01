@@ -56,14 +56,14 @@ FIELD_MAP_PATH = Path(config.DATA_OUTPUTS) / "Field_Names_By_Province.xlsx"
 # FIELD MAP — loaded from Excel at startup
 #
 # SOURCE_FIELDS maps a lowercase keyword (matching part of a GeoJSON filename)
-# to a dict with three keys — "name", "type", "area" — each holding an ordered
-# list of GeoJSON property names to try when reading a feature.
+# to a dict with three keys — "name", "type", "area" — each holding a list
+# containing the single GeoJSON property name to use for that attribute.
 #
 # Example entry:
 #   "alberta": {
 #       "name": ["NAME"],
 #       "type": ["TYPE"],
-#       "area": ["ACRES", "HECTARES"],
+#       "area": ["HECTARES"],
 #   }
 #
 # "national_parks" is always checked first so that files like
@@ -76,18 +76,17 @@ def _load_field_map(path: Path) -> dict[str, dict]:
 
     The workbook has two sheets:
 
-    - "ProvincialParks": one row per province. Columns are Abbreviation,
-      Name Field, Type Field, Area Field.  We translate the abbreviation
-      (e.g. "CA-AB") to a filename keyword (e.g. "alberta") so we can match
-      it against the GeoJSON filename at load time.
+    - "ProvincialParks": one row per province. Columns are Province (sentence
+      case name, e.g. "British Columbia"), Name Field, Type Field, Area Field.
+      The province name is converted to a lowercase underscore keyword
+      (e.g. "british_columbia") to match against the GeoJSON filename stem.
 
     - "National Parks": a single row with Name Field and Type Field only,
       stored under the key "national_parks".
 
-    Some cells contain annotations or multiple candidates:
-      - "PARKTYPE (coded)"        → we strip "(coded)", leaving ["PARKTYPE"]
-      - "TYPE_ENG + PROV_CLASS"   → we strip the "+ ..." part, leaving ["TYPE_ENG"]
-      - "ACRES or HECTARES"       → we split on " or ", giving ["ACRES", "HECTARES"]
+    Some cells contain annotations that are stripped before use:
+      - "PARKTYPE (coded)"      → strips "(coded)", leaving "PARKTYPE"
+      - "TYPE_ENG + PROV_CLASS" → strips the "+ ..." part, leaving "TYPE_ENG"
 
     The actual acronym expansion and composite-field logic is handled later by
     PARK_TYPE_HOOKS, not here.
@@ -104,36 +103,45 @@ def _load_field_map(path: Path) -> dict[str, dict]:
         print(f"WARNING: Field map not found at {path}. Falling back to generic field names.")
         return {}
 
-    # This dict translates the abbreviation column in the spreadsheet into the
-    # lowercase keyword we look for in the GeoJSON filename stem.
-    ABBREV_TO_KEYWORD: dict[str, str] = {
-        "CA-AB": "alberta",
-        "CA-BC": "british_columbia",
-        "CA-MB": "manitoba",
-        "CA-NB": "new_brunswick",
-        "CA-NL": "newfoundland",
-        "CA-NS": "nova_scotia",
-        "CA-ON": "ontario",
-        "CA-QC": "quebec",
-        "CA-SK": "saskatchewan",
-        "CA-YT": "yukon",
-    }
+    def _province_to_keyword(province: str) -> str:
+        """
+        Convert a sentence-case province name to a lowercase underscore keyword
+        that can be matched against GeoJSON filename stems.
+
+        For example:
+            "British Columbia" → "british_columbia"
+            "Nova Scotia"      → "nova_scotia"
+            "Alberta"          → "alberta"
+
+        Args:
+            province: The province name as it appears in the spreadsheet.
+
+        Returns:
+            A lowercase, underscore-separated keyword string.
+        """
+        # .lower() converts to lowercase, .replace() swaps spaces for underscores.
+        # These are chained — Python evaluates left to right, passing the result
+        # of each method call into the next.
+        return province.strip().lower().replace(" ", "_")
 
     def _parse_fields(raw: str | float) -> list[str]:
         """
         Convert a single spreadsheet cell value into an ordered list of
         GeoJSON field name candidates.
 
-        Handles three annotation patterns written into the spreadsheet:
-          - "(coded)" suffix   → stripped (acronym expansion is done by hooks)
-          - "+ OTHER_FIELD"    → stripped (composite logic is done by hooks)
-          - "FIELD_A or FIELD_B" → split into ["FIELD_A", "FIELD_B"]
+        Handles two annotation patterns written into the spreadsheet:
+          - "(coded)" suffix  → stripped (acronym expansion is done by hooks)
+          - "+ OTHER_FIELD"   → stripped (composite logic is done by hooks)
+
+        Each area cell now contains exactly one field name, so no splitting
+        on " or " is needed.
 
         Args:
             raw: The raw cell value from pandas (may be a float NaN if empty).
 
         Returns:
-            A list of field name strings, or an empty list if the cell is blank.
+            A list containing the single cleaned field name, or an empty list
+            if the cell is blank.
         """
         # pandas represents empty cells as float NaN, so we check for that too.
         if not raw or (isinstance(raw, float) and pd.isna(raw)):
@@ -148,11 +156,9 @@ def _load_field_map(path: Path) -> dict[str, dict]:
         # The hook for that province will handle reading the second field itself.
         raw = raw.split("+")[0].strip()
 
-        # Split "FIELD_A or FIELD_B" into a list so _first() can try each in order.
-        parts = [p.strip() for p in raw.split(" or ")]
-
-        # Filter out any empty strings that might result from the splits above.
-        return [p for p in parts if p]
+        # Return as a single-element list to keep the return type consistent
+        # with _first(), which always expects a list to iterate over.
+        return [raw] if raw else []
 
     # pd.read_excel with sheet_name=None reads ALL sheets into a dict of
     # {sheet_name: DataFrame}.  This lets us handle both tabs in one call.
@@ -169,12 +175,15 @@ def _load_field_map(path: Path) -> dict[str, dict]:
     # iterrows() yields (index, row) pairs; we use _ to discard the index
     # since we don't need row numbers here.
     for _, row in prov_df.iterrows():
-        abbrev  = str(row.get("Abbreviation", "")).strip()
-        keyword = ABBREV_TO_KEYWORD.get(abbrev)  # e.g. "CA-AB" → "alberta"
+        province = str(row.get("Province", "")).strip()
 
-        # Skip rows with abbreviations we don't recognise (e.g. blank rows).
-        if not keyword:
+        # Skip blank rows (pandas may read trailing empty rows from Excel).
+        if not province or province == "nan":
             continue
+
+        # Convert "British Columbia" → "british_columbia" so we can match it
+        # against the GeoJSON filename stem (e.g. "british_columbia_provincial_parks").
+        keyword = _province_to_keyword(province)
 
         result[keyword] = {
             "name": _parse_fields(row.get("Name Field")),
@@ -429,6 +438,9 @@ def _ontario_park_type(props: dict, raw: str | None) -> str | None:
 # the filename — the first match wins. Order matters if two keys could both
 # match the same filename (e.g. "new" and "new_brunswick"), so be specific.
 PARK_TYPE_HOOKS: dict[str, callable] = {
+    "national_parks": acronym_map({
+        "NP":  "National Park"
+    }),
     "alberta": acronym_map({
         "ER":  "Ecological Reserve",
         "HR":  "Heritage Rangeland",
@@ -529,19 +541,12 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
             # No field map entry — try a long list of common field names used
             # across different provinces and data sources.
             name = (
-                props.get("PROTECTED_AREA_NAME_ENG") or
-                props.get("PROTECTED_LANDS_NAME") or
-                props.get("Pro_Name") or
                 props.get("name") or
                 props.get("NAME") or
                 props.get("park_name") or
                 props.get("PARK_NAME") or
                 props.get("PARKNM") or
                 props.get("NAME_E") or
-                props.get("NAMEEN") or
-                props.get("label") or
-                props.get("LABEL") or
-                props.get("TOPONYME") or
                 f"Park {id_offset + i + 1}"  # Last resort: a numbered placeholder.
             )
 
@@ -558,18 +563,6 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
                 props.get("type") or
                 props.get("TYPE_E") or
                 props.get("TYPE_ENG") or
-                props.get("PROTECTED_AREA_TYPE") or
-                props.get("PROTECTED_LANDS_DESIGNATION") or
-                props.get("IUCN_CAT") or
-                props.get("iucn_cat") or
-                props.get("DESIGNATION") or
-                props.get("DESIGNOM") or
-                props.get("designation") or
-                props.get("LAND_CLASS") or
-                props.get("land_class") or
-                props.get("MGMT_CLASS") or
-                props.get("CLASS") or
-                props.get("Protect1") or
                 None
             )
 
