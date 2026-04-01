@@ -21,6 +21,7 @@ Requirements:
 import sys
 import json
 from pathlib import Path
+import pandas as pd
 from flask import Flask, jsonify, render_template_string
 
 # =============================================================================
@@ -40,6 +41,117 @@ except ImportError:
     sys.exit(1)
 
 PARKS_DIR = Path(config.PARKS_DIR)
+FIELD_MAP_PATH = Path(config.DATA_OUTPUTS) / "Field_Names_By_Province.xlsx"
+
+# =============================================================================
+# FIELD MAP — loaded from Excel at startup
+#
+# SOURCE_FIELDS maps a lowercase substring of the GeoJSON filename stem to a
+# dict with keys:  name, type, area  (each a list of field names to try in
+# order, or None for that attribute).
+#
+# "national_parks" is matched first so that NB_National_Parks.geojson and
+# ON_National_Parks.geojson use the National Parks tab rather than the
+# provincial mappings.
+# =============================================================================
+
+def _load_field_map(path: Path) -> dict[str, dict]:
+    """
+    Read Field_Names_By_Province.xlsx and return SOURCE_FIELDS.
+
+    The ProvincialParks sheet maps province abbreviations to field names.
+    We translate those to filename-stem keywords using ABBREV_TO_KEYWORD.
+
+    The National Parks sheet has a single row (no province column) and is
+    stored under the key "national_parks".
+
+    Area fields that contain " or " (e.g. "ACRES or HECTARES") are expanded
+    into a list of candidates.  Type fields annotated with "(coded)" or
+    "+ ..." have those annotations stripped — the actual expansion/combination
+    is handled by PARK_TYPE_HOOKS.
+    """
+    if not path.exists():
+        print(f"WARNING: Field map not found at {path}. Falling back to generic field names.")
+        return {}
+
+    # Maps province abbreviation → lowercase keyword found in the filename stem
+    ABBREV_TO_KEYWORD: dict[str, str] = {
+        "CA-AB": "alberta",
+        "CA-BC": "british_columbia",
+        "CA-MB": "manitoba",
+        "CA-NB": "new_brunswick",
+        "CA-NL": "newfoundland",
+        "CA-NS": "nova_scotia",
+        "CA-ON": "ontario",
+        "CA-QC": "quebec",
+        "CA-SK": "saskatchewan",
+        "CA-YT": "yukon",
+    }
+
+    def _parse_fields(raw: str | float) -> list[str]:
+        """Split a cell value into a list of field name candidates."""
+        if not raw or (isinstance(raw, float) and pd.isna(raw)):
+            return []
+        raw = str(raw).strip()
+        # Strip annotations like "(coded)", "+ PROVINCIAL_PARK_CLASS_ENG"
+        raw = raw.split("(coded)")[0].strip()
+        raw = raw.split("+")[0].strip()
+        # Handle "FIELD_A or FIELD_B"
+        parts = [p.strip() for p in raw.split(" or ")]
+        return [p for p in parts if p]
+
+    xl = pd.read_excel(path, sheet_name=None)
+    result: dict[str, dict] = {}
+
+    # --- Provincial Parks tab ---
+    prov_df = xl.get("ProvincialParks", pd.DataFrame())
+    for _, row in prov_df.iterrows():
+        abbrev = str(row.get("Abbreviation", "")).strip()
+        keyword = ABBREV_TO_KEYWORD.get(abbrev)
+        if not keyword:
+            continue
+        result[keyword] = {
+            "name": _parse_fields(row.get("Name Field")),
+            "type": _parse_fields(row.get("Type Field")),
+            "area": _parse_fields(row.get("Area Field")),
+        }
+
+    # --- National Parks tab ---
+    nat_df = xl.get("National Parks", pd.DataFrame())
+    if not nat_df.empty:
+        row = nat_df.iloc[0]
+        result["national_parks"] = {
+            "name": _parse_fields(row.get("Name Field")),
+            "type": _parse_fields(row.get("Type Field")),
+            "area": [],   # no area column on this tab
+        }
+
+    return result
+
+
+SOURCE_FIELDS: dict[str, dict] = _load_field_map(FIELD_MAP_PATH)
+
+
+def _get_source_fields(stem_lower: str) -> dict | None:
+    """
+    Return the field spec for this file stem, checking national_parks first
+    so that e.g. 'ON_National_Parks' doesn't accidentally match 'ontario'.
+    """
+    if "national_parks" in stem_lower:
+        return SOURCE_FIELDS.get("national_parks")
+    return next(
+        (spec for key, spec in SOURCE_FIELDS.items() if key != "national_parks" and key in stem_lower),
+        None,
+    )
+
+
+def _first(props: dict, fields: list[str]):
+    """Return the first non-empty value found in props for the given field list."""
+    for f in fields:
+        v = props.get(f)
+        if v is not None and str(v).strip():
+            return v
+    return None
 
 # =============================================================================
 # FLASK APP
@@ -66,6 +178,47 @@ if not PARKS_DIR.exists():
 # For simple acronym-only sources a helper is provided: acronym_map(mapping).
 # For sources that need richer logic, write the function directly.
 # =============================================================================
+
+def to_sentence_case(text: str) -> str:
+    """
+    Convert an ALL-CAPS string to sentence/title case.
+
+    Each word is title-cased, but small joining words (of, the, and, …) are
+    kept lowercase unless they are the first word.  Handles hyphenated words
+    by title-casing each part (e.g. "NORTH-WEST" → "North-West").
+
+    If the text is NOT all-uppercase we leave it untouched so that sources
+    which already have correct mixed-case are never altered.
+    """
+    if not text or not text.isupper():
+        return text
+    LOWERCASE_WORDS = {
+        "a", "an", "and", "as", "at", "but", "by", "for", "from",
+        "in", "into", "nor", "of", "on", "or", "the", "to", "up",
+        "via", "with",
+    }
+    def _title_word(word: str) -> str:
+        # Handle hyphenated segments (e.g. NORTH-WEST)
+        parts = word.split("-")
+        return "-".join(p.capitalize() for p in parts)
+
+    words = text.split()
+    result = []
+    for idx, word in enumerate(words):
+        lower = word.lower()
+        if idx == 0 or lower not in LOWERCASE_WORDS:
+            result.append(_title_word(word))
+        else:
+            result.append(lower)
+    return " ".join(result)
+
+
+# Sources whose park names and/or park types are stored in ALL-CAPS and
+# should be converted to sentence/title case during loading.
+# Keys are lowercase substrings of the GeoJSON filename stem.
+NAME_CASE_SOURCES:  set[str] = {"british_columbia", "ontario"}
+TYPE_CASE_SOURCES:  set[str] = {"british_columbia"}
+
 
 def acronym_map(mapping: dict[str, str]):
     """Return a hook that expands acronyms using the given dict."""
@@ -101,6 +254,7 @@ PARK_TYPE_HOOKS: dict[str, callable] = {
         "PP":  "Provincial Park",
         "PRA": "Provincial Recreation Area",
         "WA":  "Wilderness Area",
+        "WP": "Wilderness Park",
         "WPP": "Wildland",
     }),
     "saskatchewan": acronym_map({
@@ -137,6 +291,9 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
         print(f"  WARNING: Unrecognised GeoJSON structure in {path.name}")
         return []
 
+    stem_lower = path.stem.lower()
+    spec = _get_source_fields(stem_lower)
+
     parks = []
     for i, feat in enumerate(features):
         if not isinstance(feat, dict):
@@ -144,56 +301,81 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
         props = feat.get("properties") or {}
         geom  = feat.get("geometry") or {}
 
-        name = (
-            props.get("PROTECTED_AREA_NAME_ENG") or
-            props.get("PROTECTED_LANDS_NAME") or
-            props.get("Pro_Name") or
-            props.get("name") or
-            props.get("NAME") or
-            props.get("park_name") or
-            props.get("PARK_NAME") or
-            props.get("PARKNM") or
-            props.get("NAME_E") or
-            props.get("NAMEEN") or
-            props.get("label") or
-            props.get("LABEL") or
-            props.get("TOPONYME") or
-            f"Park {id_offset + i + 1}"
-        )
+        # ── Name ──────────────────────────────────────────────────────
+        if spec and spec["name"]:
+            name = _first(props, spec["name"]) or f"Park {id_offset + i + 1}"
+        else:
+            # Generic fallback (used when no field map entry exists for this file)
+            name = (
+                props.get("PROTECTED_AREA_NAME_ENG") or
+                props.get("PROTECTED_LANDS_NAME") or
+                props.get("Pro_Name") or
+                props.get("name") or
+                props.get("NAME") or
+                props.get("park_name") or
+                props.get("PARK_NAME") or
+                props.get("PARKNM") or
+                props.get("NAME_E") or
+                props.get("NAMEEN") or
+                props.get("label") or
+                props.get("LABEL") or
+                props.get("TOPONYME") or
+                f"Park {id_offset + i + 1}"
+            )
 
-        # Extract park type from common field names
-        park_type = (
-            props.get("PARK_TYPE") or
-            props.get("park_type") or
-            props.get("PARKTYPE") or
-            props.get("TYPE") or
-            props.get("type") or
-            props.get("TYPE_E") or
-            props.get("TYPE_ENG") or
-            props.get("PROTECTED_AREA_TYPE") or
-            props.get("PROTECTED_LANDS_DESIGNATION") or
-            props.get("IUCN_CAT") or
-            props.get("iucn_cat") or
-            props.get("DESIGNATION") or
-            props.get("designation") or
-            props.get("LAND_CLASS") or
-            props.get("land_class") or
-            props.get("MGMT_CLASS") or
-            props.get("CLASS") or
-            props.get("Protect1") or
-            None
-        )
+        # ── Park type (raw) ────────────────────────────────────────────
+        if spec and spec["type"]:
+            park_type = _first(props, spec["type"])
+        else:
+            park_type = (
+                props.get("PARK_TYPE") or
+                props.get("park_type") or
+                props.get("PARKTYPE") or
+                props.get("TYPE") or
+                props.get("type") or
+                props.get("TYPE_E") or
+                props.get("TYPE_ENG") or
+                props.get("PROTECTED_AREA_TYPE") or
+                props.get("PROTECTED_LANDS_DESIGNATION") or
+                props.get("IUCN_CAT") or
+                props.get("iucn_cat") or
+                props.get("DESIGNATION") or
+                props.get("DESIGNOM") or
+                props.get("designation") or
+                props.get("LAND_CLASS") or
+                props.get("land_class") or
+                props.get("MGMT_CLASS") or
+                props.get("CLASS") or
+                props.get("Protect1") or
+                None
+            )
         if park_type:
             park_type = str(park_type).strip()
 
-        # Apply any per-source park type hook (first matching key wins)
-        stem_lower = path.stem.lower()
+        # ── Park type hook (acronym expansion, composite fields, etc.) ─
         hook = next((fn for key, fn in PARK_TYPE_HOOKS.items() if key in stem_lower), None)
         if hook:
             park_type = hook(props, park_type)
 
+        # ── Normalise casing for ALL-CAPS sources ─────────────────────
+        if any(key in stem_lower for key in NAME_CASE_SOURCES):
+            name = to_sentence_case(str(name).strip())
+        if any(key in stem_lower for key in TYPE_CASE_SOURCES):
+            if park_type:
+                park_type = to_sentence_case(park_type)
+
+        # ── Area ──────────────────────────────────────────────────────
+        if spec and spec["area"]:
+            area_ha = _first(props, spec["area"])
+        else:
+            area_ha = (
+                props.get("area_ha") or
+                props.get("HA_GIS") or
+                props.get("AREA_HA") or
+                props.get("Shape_Area")
+            )
+
         source   = path.stem
-        area_ha  = props.get("area_ha") or props.get("HA_GIS") or props.get("AREA_HA") or props.get("Shape_Area")
         province = props.get("province") or props.get("PROVINCE") or props.get("prov") or props.get("PROV") or ""
 
         parks.append({
