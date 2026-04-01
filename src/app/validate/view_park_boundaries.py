@@ -210,24 +210,16 @@ def _load_field_map(path: Path) -> dict[str, dict]:
 # module is first imported (or when the script is run directly).
 SOURCE_FIELDS: dict[str, dict] = _load_field_map(FIELD_MAP_PATH)
 
-# Reverse lookup: keyword → display province name, built from the same workbook
-# data so it never goes out of sync.  National park files are mapped to their
-# province via the filename (e.g. "ON_National_Parks" → "Ontario").
-# Keys are the same lowercase underscore keywords used in SOURCE_FIELDS.
-# Values are the original sentence-case province names from the spreadsheet.
-#
-# This is built separately from SOURCE_FIELDS because _load_field_map() only
-# stores field specs, not the original province name strings.
+
 def _build_keyword_to_province(path: Path) -> dict[str, str]:
     """
-    Read the Province column from ProvincialParks tab and return a dict mapping
-    each lowercase-underscore keyword back to its display name.
+    Build a reverse lookup from filename keyword → display province name.
 
-    For example:
-        {"ontario": "Ontario", "british_columbia": "British Columbia", ...}
+    For example: {"ontario": "Ontario", "british_columbia": "British Columbia"}
 
-    National park files are handled in load_parks_from_file() by checking
-    whether the filename contains a province keyword.
+    This is used to derive the province for each park from its filename,
+    so both "ontario_provincial_parks" and "ON_National_Parks" resolve to
+    the same display name "Ontario" and appear together in the province filter.
 
     Args:
         path: Path to the Excel workbook.
@@ -237,16 +229,17 @@ def _build_keyword_to_province(path: Path) -> dict[str, str]:
     """
     if not path.exists():
         return {}
-    xl = pd.read_excel(path, sheet_name=None)
-    prov_df = xl.get("ProvincialParks", pd.DataFrame())
-    result = {}
+    xl       = pd.read_excel(path, sheet_name=None)
+    prov_df  = xl.get("ProvincialParks", pd.DataFrame())
+    result   = {}
     for _, row in prov_df.iterrows():
         province = str(row.get("Province", "")).strip()
         if not province or province == "nan":
             continue
-        keyword = province.strip().lower().replace(" ", "_")
-        result[keyword] = province  # e.g. "ontario" → "Ontario"
+        keyword          = province.strip().lower().replace(" ", "_")
+        result[keyword]  = province   # e.g. "ontario" → "Ontario"
     return result
+
 
 KEYWORD_TO_PROVINCE: dict[str, str] = _build_keyword_to_province(FIELD_MAP_PATH)
 
@@ -661,42 +654,31 @@ def load_parks_from_file(path: Path, id_offset: int) -> list[dict]:
         # in the UI, e.g. "alberta_provincial_parks".
         source = path.stem
 
-        # Derive the display province name from the filename.
+        # Derive the display province name from the filename so that national
+        # park files and provincial park files for the same province share the
+        # same value (e.g. "ON_National_Parks" and "ontario_provincial_parks"
+        # both resolve to "Ontario").
         #
-        # Provincial park files contain the full province name in the stem
-        # (e.g. "ontario_provincial_parks") so a simple keyword substring
-        # match against KEYWORD_TO_PROVINCE works fine.
-        #
-        # National park files use a two-letter prefix instead
-        # (e.g. "ON_National_Parks", "NB_National_Parks"), so we need a
-        # separate abbreviation lookup for those.
+        # National park files use a two-letter prefix (e.g. "ON_National_Parks")
+        # so we handle them separately with an abbreviation lookup.
+        # Provincial files contain the full name keyword in the stem.
         NATIONAL_PARK_ABBREVS: dict[str, str] = {
-            "ab": "Alberta",
-            "bc": "British Columbia",
-            "mb": "Manitoba",
-            "nb": "New Brunswick",
-            "nl": "Newfoundland",
-            "ns": "Nova Scotia",
-            "on": "Ontario",
-            "qc": "Quebec",
-            "sk": "Saskatchewan",
-            "yt": "Yukon",
+            "ab": "Alberta",          "bc": "British Columbia",
+            "mb": "Manitoba",         "nb": "New Brunswick",
+            "nl": "Newfoundland",     "ns": "Nova Scotia",
+            "on": "Ontario",          "qc": "Quebec",
+            "sk": "Saskatchewan",     "yt": "Yukon",
         }
-
         if "national_parks" in stem_lower:
-            # Extract the two-letter prefix before the first underscore,
-            # e.g. "on_national_parks" → "on"
-            prefix = stem_lower.split("_")[0]
+            prefix   = stem_lower.split("_")[0]   # e.g. "on_national_parks" → "on"
             province = NATIONAL_PARK_ABBREVS.get(prefix, "")
         else:
-            # For provincial files, match the full keyword against the stem.
             province = next(
                 (display for kw, display in KEYWORD_TO_PROVINCE.items() if kw in stem_lower),
                 None,
             )
-            # Fall back to a province field in the GeoJSON properties if the
-            # filename didn't match any known keyword.
             if not province:
+                # Fall back to a GeoJSON property for any unrecognised file.
                 province = (
                     props.get("province") or props.get("PROVINCE") or
                     props.get("prov")     or props.get("PROV")     or ""
@@ -859,9 +841,8 @@ def api_boundary_provinces():
     """
     Return a sorted list of unique province display names.
 
-    Used to populate the province filter dropdown. Because province is derived
-    from the filename keyword, this list is always consistent regardless of
-    what (if anything) the GeoJSON properties contain.
+    Because province is derived from the filename, this list is consistent
+    regardless of what the GeoJSON properties contain.
     """
     seen = sorted({p["province"] for p in ALL_PARK_BOUNDARIES if p["province"]})
     return jsonify(seen)
@@ -1005,7 +986,8 @@ HTML_TEMPLATE = """
     display: flex; gap: 5px; padding: 4px 12px 6px; flex-shrink: 0;
     flex-wrap: wrap;
   }
-  #park-filter-row > .filter-select { flex: 1; min-width: calc(50% - 3px); }
+  #park-filter-row > .filter-select,
+  #park-filter-row > .multi-select-wrap { flex: 1; min-width: calc(50% - 3px); }
   .filter-select {
     width: 100%; background: var(--bg); border: 1px solid var(--border2); border-radius: 5px;
     color: var(--text); font-family: 'Space Mono', monospace; font-size: 10px;
@@ -1016,6 +998,41 @@ HTML_TEMPLATE = """
   }
   .filter-select:focus { border-color: var(--accent); }
   .filter-select option { background: var(--surface); }
+
+  /* ── Multi-select checkbox dropdown ── */
+  .multi-select-wrap { position: relative; }
+  .multi-select-btn {
+    width: 100%; background: var(--bg); border: 1px solid var(--border2); border-radius: 5px;
+    color: var(--text); font-family: 'Space Mono', monospace; font-size: 10px;
+    padding: 6px 24px 6px 8px; outline: none; cursor: pointer;
+    transition: border-color 0.15s; appearance: none; text-align: left;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%235a6478'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 8px center;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .multi-select-btn.active { border-color: var(--accent); color: var(--accent); }
+  .multi-select-dropdown {
+    display: none; position: absolute; top: calc(100% + 3px); left: 0; right: 0;
+    background: var(--surface); border: 1px solid var(--border2); border-radius: 5px;
+    z-index: 900; max-height: 220px; overflow-y: auto;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.4);
+  }
+  .multi-select-dropdown.open { display: block; }
+  .multi-select-option {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px; cursor: pointer; font-size: 10px;
+    transition: background 0.1s;
+  }
+  .multi-select-option:hover { background: var(--surface2); }
+  .multi-select-option input[type="checkbox"] {
+    accent-color: var(--accent); cursor: pointer; flex-shrink: 0;
+  }
+  .multi-select-clear {
+    padding: 5px 10px; font-size: 9px; color: var(--text-dim);
+    border-top: 1px solid var(--border); cursor: pointer; text-align: right;
+    letter-spacing: 0.5px; text-transform: uppercase;
+  }
+  .multi-select-clear:hover { color: var(--accent); }
 
   /* ── Select All button ── */
   #btn-select-all-parks {
@@ -1122,15 +1139,20 @@ HTML_TEMPLATE = """
 
   <div class="ctrl-section-label">Filter by</div>
   <div id="park-filter-row">
-    <select id="park-province-filter" class="filter-select">
-      <option value="">🍁 All provinces</option>
-    </select>
+    <!-- Province multi-select -->
+    <div class="multi-select-wrap" id="province-wrap">
+      <button class="multi-select-btn" id="province-btn">🍁 All provinces</button>
+      <div class="multi-select-dropdown" id="province-dropdown"></div>
+    </div>
+    <!-- Source single-select -->
     <select id="park-source-filter" class="filter-select">
       <option value="">🌲 All files</option>
     </select>
-    <select id="park-type-filter" class="filter-select">
-      <option value="">🏷 All types</option>
-    </select>
+    <!-- Type multi-select -->
+    <div class="multi-select-wrap" id="type-wrap">
+      <button class="multi-select-btn" id="type-btn">🏷 All types</button>
+      <div class="multi-select-dropdown" id="type-dropdown"></div>
+    </div>
     <button id="btn-select-all-parks" title="Select / deselect all visible parks">Select All</button>
   </div>
 
@@ -1319,19 +1341,119 @@ async function togglePark(id) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// MULTI-SELECT DROPDOWN FACTORY
+// ═══════════════════════════════════════════════════════════════════
+
+// multiSelect() builds and manages a custom checkbox dropdown.
+// It returns an object with:
+//   .populate(items)   — rebuild the option list
+//   .selected          — Set of currently checked values
+//   .onchange          — assign a callback for when selection changes
+//
+// This is a closure (a function that returns an object with its own
+// private state), so each dropdown — province and type — is fully
+// independent.
+function multiSelect(btnId, dropdownId, emptyLabel) {
+  const btn      = document.getElementById(btnId);
+  const dropdown = document.getElementById(dropdownId);
+  const state    = { selected: new Set(), onchange: null };
+
+  // Toggle the dropdown open/closed when the button is clicked.
+  btn.addEventListener('click', e => {
+    e.stopPropagation();  // Prevent the document click handler from immediately closing it.
+    dropdown.classList.toggle('open');
+  });
+
+  // Close this dropdown when the user clicks anywhere outside it.
+  document.addEventListener('click', () => dropdown.classList.remove('open'));
+
+  function _updateBtn() {
+    // Update the button label to reflect the current selection count.
+    if (state.selected.size === 0) {
+      btn.textContent = emptyLabel;
+      btn.classList.remove('active');
+    } else {
+      btn.textContent = emptyLabel.split(' ')[0] + ' ' + state.selected.size + ' selected';
+      btn.classList.add('active');
+    }
+  }
+
+  function populate(items) {
+    // Rebuild the dropdown checkbox list from a fresh array of string values.
+    // Preserve any currently-checked items that still exist in the new list.
+    dropdown.innerHTML = '';
+
+    items.forEach(val => {
+      const row = document.createElement('div');
+      row.className = 'multi-select-option';
+
+      const cb = document.createElement('input');
+      cb.type    = 'checkbox';
+      cb.value   = val;
+      cb.checked = state.selected.has(val);  // Restore checked state if still valid.
+
+      cb.addEventListener('change', () => {
+        if (cb.checked) state.selected.add(val);
+        else            state.selected.delete(val);
+        _updateBtn();
+        if (state.onchange) state.onchange();
+      });
+
+      const label = document.createElement('span');
+      label.textContent = val;
+
+      row.appendChild(cb);
+      row.appendChild(label);
+      // Clicking the row label also toggles the checkbox.
+      row.addEventListener('click', e => { if (e.target !== cb) cb.click(); });
+      dropdown.appendChild(row);
+    });
+
+    // "Clear" link at the bottom of the dropdown.
+    if (items.length > 0) {
+      const clear = document.createElement('div');
+      clear.className   = 'multi-select-clear';
+      clear.textContent = 'Clear';
+      clear.addEventListener('click', e => {
+        e.stopPropagation();
+        state.selected.clear();
+        dropdown.querySelectorAll('input[type="checkbox"]').forEach(cb => cb.checked = false);
+        _updateBtn();
+        if (state.onchange) state.onchange();
+      });
+      dropdown.appendChild(clear);
+    }
+
+    // Remove any previously-selected values that are no longer in the list.
+    for (const v of [...state.selected]) {
+      if (!items.includes(v)) state.selected.delete(v);
+    }
+    _updateBtn();
+  }
+
+  return { get selected() { return state.selected; }, populate, set onchange(fn) { state.onchange = fn; } };
+}
+
+// Create the two multi-select instances.
+const provinceFilter = multiSelect('province-btn', 'province-dropdown', '🍁 All provinces');
+const typeFilter     = multiSelect('type-btn',     'type-dropdown',     '🏷 All types');
+
+// ═══════════════════════════════════════════════════════════════════
 // RENDER PARK LIST
 // ═══════════════════════════════════════════════════════════════════
 function renderParkList() {
   const list = document.getElementById('park-list');
   const q    = document.getElementById('park-search').value.toLowerCase();
-  const prov = document.getElementById('park-province-filter').value;
   const src  = document.getElementById('park-source-filter').value;
-  const typ  = document.getElementById('park-type-filter').value;
+
+  // A Set with zero items means "no filter" — show everything.
+  const provs = provinceFilter.selected;
+  const types  = typeFilter.selected;
 
   filteredBoundaries = allBoundaries.filter(p => {
-    if (prov && p.province !== prov) return false;
-    if (src  && p.source   !== src)  return false;
-    if (typ  && p.park_type !== typ) return false;
+    if (provs.size > 0 && !provs.has(p.province))  return false;
+    if (src  && p.source !== src)                   return false;
+    if (types.size > 0 && !types.has(p.park_type)) return false;
     if (q && !(p.name || '').toLowerCase().includes(q) &&
              !(p.source    || '').toLowerCase().includes(q) &&
              !(p.park_type || '').toLowerCase().includes(q) &&
@@ -1375,53 +1497,43 @@ function renderParkList() {
 // WIRE UP CONTROLS
 // ═══════════════════════════════════════════════════════════════════
 
-// Repopulate the source dropdown to only show files present in the
-// currently selected province (or all files when no province is selected).
+// Repopulate the source dropdown to only show files from the selected provinces.
 function updateSourceFilter() {
-  const prov = document.getElementById('park-province-filter').value;
-  const sel  = document.getElementById('park-source-filter');
-  const prev = sel.value;
+  const src  = document.getElementById('park-source-filter');
+  const prev = src.value;
+  const provs = provinceFilter.selected;
 
   const sources = [...new Set(
     allBoundaries
-      .filter(p => !prov || p.province === prov)
+      .filter(p => provs.size === 0 || provs.has(p.province))
       .map(p => p.source)
       .filter(Boolean)
   )].sort();
 
-  sel.innerHTML = '<option value="">🌲 All files</option>';
+  src.innerHTML = '<option value="">🌲 All files</option>';
   sources.forEach(s => {
     const opt = document.createElement('option');
     opt.value = s; opt.textContent = s;
-    sel.appendChild(opt);
+    src.appendChild(opt);
   });
-
-  sel.value = sources.includes(prev) ? prev : '';
+  src.value = sources.includes(prev) ? prev : '';
 }
 
-// Repopulate the type dropdown to only show types present in the
-// currently selected province and/or source file.
+// Repopulate the type multi-select to show only types present given
+// the current province and source selections.
 function updateTypeFilter() {
-  const prov = document.getElementById('park-province-filter').value;
-  const src  = document.getElementById('park-source-filter').value;
-  const sel  = document.getElementById('park-type-filter');
-  const prev = sel.value;
+  const src   = document.getElementById('park-source-filter').value;
+  const provs = provinceFilter.selected;
 
   const types = [...new Set(
     allBoundaries
-      .filter(p => (!prov || p.province === prov) && (!src || p.source === src))
+      .filter(p => (provs.size === 0 || provs.has(p.province)) &&
+                   (!src || p.source === src))
       .map(p => p.park_type)
       .filter(Boolean)
   )].sort();
 
-  sel.innerHTML = '<option value="">🏷 All types</option>';
-  types.forEach(t => {
-    const opt = document.createElement('option');
-    opt.value = t; opt.textContent = t;
-    sel.appendChild(opt);
-  });
-
-  sel.value = types.includes(prev) ? prev : '';
+  typeFilter.populate(types);
 }
 
 document.querySelectorAll('.sort-btn[data-psort]').forEach(btn => {
@@ -1431,16 +1543,12 @@ document.querySelectorAll('.sort-btn[data-psort]').forEach(btn => {
   };
 });
 document.getElementById('park-search').addEventListener('input', renderParkList);
-document.getElementById('park-province-filter').addEventListener('change', () => {
-  updateSourceFilter();
-  updateTypeFilter();
-  renderParkList();
-});
 document.getElementById('park-source-filter').addEventListener('change', () => {
   updateTypeFilter();
   renderParkList();
 });
-document.getElementById('park-type-filter').addEventListener('change', renderParkList);
+provinceFilter.onchange = () => { updateSourceFilter(); updateTypeFilter(); renderParkList(); };
+typeFilter.onchange     = () => renderParkList();
 
 // ═══════════════════════════════════════════════════════════════════
 // BOOTSTRAP
@@ -1464,21 +1572,17 @@ async function init() {
   fill.style.width = '90%'; label.textContent = 'Rendering…';
   await new Promise(r => setTimeout(r, 30));
 
-  // Populate province filter
-  provinces.forEach(p => {
-    const opt = document.createElement('option');
-    opt.value = p; opt.textContent = p;
-    document.getElementById('park-province-filter').appendChild(opt);
-  });
+  // Populate province multi-select.
+  provinceFilter.populate(provinces);
 
-  // Populate source filter
+  // Populate source single-select.
   sources.forEach(s => {
     const opt = document.createElement('option');
     opt.value = s; opt.textContent = s;
     document.getElementById('park-source-filter').appendChild(opt);
   });
 
-  // Populate park type filter (all types, no restrictions yet)
+  // Populate type multi-select (all types, no restrictions yet).
   updateTypeFilter();
 
   renderParkList();
@@ -1488,9 +1592,7 @@ async function init() {
   document.getElementById('loading-wrap').style.display = 'none';
 
   const countEl = document.getElementById('park-count');
-  countEl.textContent =
-    allBoundaries.length + ' park' + (allBoundaries.length !== 1 ? 's' : '') +
-    (types.length ? ' · ' + types.length + ' type' + (types.length !== 1 ? 's' : '') : '');
+  countEl.textContent = allBoundaries.length + ' park' + (allBoundaries.length !== 1 ? 's' : '');
 }
 
 init();
